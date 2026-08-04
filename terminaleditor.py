@@ -17,6 +17,7 @@ import argparse
 import curses
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -26,12 +27,12 @@ from pathlib import Path
 
 
 APP_NAME = "TerminalEditor"
-VERSION = "0.1.0"
+VERSION = "0.1.2"
 AUTOSAVE_SECONDS = 0.5
 UNDO_LIMIT = 200
 TAB_WIDTH = 4
 EDIT_WIDTH = 80
-SHORTCUT_TEXT = """^Q quit
+SHORTCUT_TEXT = """^Q quit    ^C copy all    ^G paste shortcuts
 ^Z undo    ^R redo
 ^A line start    ^E line end
 ^B back    ^F forward    ^P up    ^N down
@@ -40,8 +41,7 @@ SHORTCUT_TEXT = """^Q quit
 ^W delete word    ^U delete to line start
 ^T transpose
 ^[ paragraph up    ^] paragraph down
-Arrows Home End Backspace Delete Enter Tab also work
-^/ paste shortcuts"""
+Arrows Home End Backspace Delete Enter Tab also work"""
 
 
 def character_width(character: str, column: int) -> int:
@@ -130,6 +130,39 @@ def wrap_line(line_number: int, text: str, width: int) -> list[VisualRow]:
     return rows
 
 
+def read_key(screen: curses.window) -> object | None:
+    try:
+        return screen.get_wch()
+    except curses.error:
+        return None
+
+
+def copy_to_clipboard(text: str) -> None:
+    commands = (
+        [["pbcopy"]]
+        if sys.platform == "darwin"
+        else [
+            ["wl-copy"],
+            ["xclip", "-selection", "clipboard"],
+            ["xsel", "--clipboard", "--input"],
+        ]
+    )
+    for command in commands:
+        try:
+            subprocess.run(
+                command,
+                input=text,
+                text=True,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            pass
+    raise OSError("no system clipboard command found")
+
+
 class Editor:
     def __init__(self, path: Path, text: str, newline: str, is_new: bool) -> None:
         normalized = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -150,6 +183,7 @@ class Editor:
         self.dirty = is_new
         self.last_save_attempt = time.monotonic()
         self.save_error: str | None = None
+        self.clipboard_error: str | None = None
 
     def snapshot(self) -> Snapshot:
         return Snapshot(tuple(self.lines), self.line, self.column)
@@ -475,10 +509,12 @@ class Editor:
         return had_error
 
     def footer(self, width: int) -> str:
-        if self.save_error:
+        if self.clipboard_error:
+            message = f"COPY ERROR: {self.clipboard_error}"
+        elif self.save_error:
             message = f"AUTOSAVE ERROR: {self.save_error}"
         else:
-            message = f"{APP_NAME} {self.path.name} ^/ shortcuts"
+            message = f"{APP_NAME} {self.path.name} ^C copy all ^G shortcuts"
         return message[:width].ljust(width)
 
     def draw(self, screen: curses.window) -> None:
@@ -543,7 +579,15 @@ class Editor:
             if self.dirty:
                 self.save()
             return False
-        if key in ("\x1f", 31):  # Ctrl-/
+        if key == "\x03":  # Ctrl-C
+            self.stop_coalescing()
+            try:
+                copy_to_clipboard("\n".join(self.lines))
+                self.clipboard_error = None
+            except OSError as error:
+                self.clipboard_error = str(error)
+            return True
+        if key == "\x07":  # Ctrl-G
             self.insert_text(SHORTCUT_TEXT)
             return True
         if key == "\x1a":  # Ctrl-Z; raw mode prevents terminal suspension.
@@ -609,10 +653,7 @@ class Editor:
         try:
             while True:
                 key: object | None
-                try:
-                    key = screen.get_wch()
-                except curses.error:
-                    key = None
+                key = read_key(screen)
 
                 if key is not None:
                     _, screen_width = screen.getmaxyx()
